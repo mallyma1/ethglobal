@@ -40,16 +40,16 @@ Every claim maps to an artifact a judge can click:
 
 | Claim | The artifact |
 |---|---|
-| "You can't claw it back mid-scroll" | Vault is a Hedera account you funded but don't hold the key to. There is no cancel button to press when the dopamine hits. |
+| "You can't quietly claw it back mid-scroll" | Stake is committed onchain — see the open decision on allowance vs vault account below. |
 | "The money really moved" | N settled transfers on HashScan, one per second of scrolling. Not a database row saying we charged you. |
 | "It stopped the moment you closed the tab" | The consensus timestamp of the final transfer. Nobody can backdate it, including us. |
 | "You did five clean focus days" | A Hedera Consensus Service topic — ordered, timestamped, tamper-proof, portable. |
-| "The bot moving my money is accountable" | World AgentKit proof that one real, unique, verified human stands behind the agent. |
+| "The bot moving my money is accountable" | World AgentKit proof that one real, unique, verified human stands behind the agent, plus framework-level policies bounding what it can call at all. |
 | "The classifier isn't rigged to charge me more" | 0G TEE-sealed inference (stretch). |
 
 **The attack this defeats:** every screen-time app has a misaligned incentive —
 actually charging you risks churn, so enforcement quietly gets softer over time.
-A vault the operator can't refund from, and a public log the operator can't edit,
+A stake the operator can't refund from, and a public log the operator can't edit,
 cannot soften itself to keep you subscribed.
 
 ---
@@ -61,13 +61,15 @@ Drains redistribute to whoever is clean at that moment. Live leaderboard showing
 who is bleeding into whose pocket. Settlement at the end of the round.
 
 **Why Hedera specifically:** `TransferTransaction` supports atomic multi-party
-transfers natively. One transaction, one second, debits your vault and credits
-all teammates simultaneously, all-or-nothing. No contract, no loop, no
-partial-failure state. Ethereum cannot do this without deploying a contract.
+transfers natively — confirmed in the Agent Kit as `TRANSFER_HBAR_TOOL`, which
+takes `transfers: Array<{accountId, amount}>`. One transaction, one second,
+debits your stake and credits all teammates simultaneously, all-or-nothing. No
+contract, no loop, no partial-failure state. Ethereum cannot do this without
+deploying a contract.
 
-**Notably: zero Solidity anywhere in this build.** Vaults are native Hedera
-accounts. That removes our biggest team gap (no confirmed contracts engineer)
-and happens to qualify for Hedera's No-Solidity track.
+**Notably: zero Solidity anywhere in this build.** That removes our biggest team
+gap (no confirmed contracts engineer) and happens to qualify for Hedera's
+No-Solidity track.
 
 ---
 
@@ -98,6 +100,74 @@ integrations, so forcing one in scores worse than skipping it.
 
 ---
 
+## Hedera Agent Kit — what the fork gives us
+
+Fork: `mallyma1/hedera-agent-kit-js` (upstream `@hashgraph/hedera-agent-kit`,
+pnpm monorepo, Node >= 18).
+
+**The critical architectural rule: two layers, deliberately separated.**
+
+| Layer | Uses | Why |
+|---|---|---|
+| Per-second drain loop | Raw `@hashgraph/sdk` | Must be fast, cheap and deterministic. **Never put an LLM in this loop** — a model call per second is slow, expensive and non-deterministic. |
+| Telegram onboarding agent | Hedera Agent Kit tools | Natural language in, Hedera transaction out. Exactly what it's for: "stake 25 HBAR and block X between 2 and 6". |
+
+Getting this wrong is the single most likely way to burn a day.
+
+**What we take from the kit:**
+
+- **`TRANSFER_HBAR_TOOL`** — multi-recipient array confirms the squad split works
+  in one atomic call.
+- **`APPROVE_HBAR_ALLOWANCE_TOOL` / `TRANSFER_HBAR_WITH_ALLOWANCE_TOOL`** — the
+  allowance path (see open decision).
+- **`HcsAuditTrailHook`** — writes every tool execution to an HCS topic
+  automatically. This is our session/streak log for free, and it's more
+  defensible than hand-rolled logging because it can't be selectively skipped.
+  Deletes ~2h of planned work.
+- **`RejectToolPolicy` / `MaxRecipientsPolicy`** — hard limits enforced at the
+  framework layer. Pairs with AgentKit for the strongest version of the World
+  pitch: *the agent is human-verified **and** capability-bounded — it cannot call
+  `delete_account`, cannot pay more than N recipients, and every action it does
+  take lands on a public audit topic.*
+- **`packages/mcp`** — the kit ships its own MCP server, so Hedera tools can be
+  driven directly from Claude during development.
+
+Relevant docs in the fork: `docs/HEDERATOOLS.md`, `docs/HOOKS_AND_POLICIES.md`,
+`docs/MCP.md`, `examples/`.
+
+---
+
+## MCP servers
+
+Already added to project config (`.mcp.json`). Note the docs server shows as
+**pending approval** until approved in an interactive `claude` session.
+
+**World Docs** — no auth, one tool (`search_world_documentation`):
+
+```bash
+claude mcp add --transport http --scope project world-docs https://docs.world.org/mcp
+```
+
+**World Developer Portal** — needs a team API key, and it is genuinely worth
+setting up rather than clicking through the web portal at hour zero. It exposes
+`create_app`, `configure_world_id`, `create_world_id_action`,
+`get_world_id_signing_key`, `rotate_world_id_signing_key`,
+`get_world_id_registration_status`, `get_app_config`, `get_team_context`,
+`configure_mini_app`, `upload_app_image`, `submit_app_for_review`:
+
+```bash
+claude mcp add world-developer-portal \
+  https://developer.world.org/api/mcp \
+  --transport http \
+  --scope project \
+  --header "Authorization: Bearer api_..."
+```
+
+That means the entire World ID app + action setup can be done from the terminal
+in minutes. Keep the key local — this server can mutate apps in the team.
+
+---
+
 ## Stack
 
 **Chrome extension** — Manifest V3, TypeScript, Vite
@@ -112,13 +182,12 @@ integrations, so forcing one in scores worse than skipping it.
 - In-memory session state (single instance, 36 hours — Redis isn't worth it)
 - `better-sqlite3` only if sessions need to survive restarts during demos
 
-**Chain** — `@hashgraph/sdk`, Hedera **testnet**, accounts from portal.hedera.com
+**Chain** — `@hashgraph/sdk` for the drain, `@hashgraph/hedera-agent-kit` for the
+agent. Hedera **testnet**, accounts from portal.hedera.com.
 - `TransferTransaction` — per-second drain, multi-recipient for squad mode
-- `TopicCreateTransaction` / `TopicMessageSubmitTransaction` — HCS log of session
-  start, each verdict, clean exit
+- HCS topic via `HcsAuditTrailHook` — session start, each verdict, clean exit
 - `ScheduleCreateTransaction` — pre-committed stake return, so getting your money
-  back doesn't depend on the agent choosing to be nice later
-- `AccountCreateTransaction` with `KeyList` — vault accounts
+  back doesn't depend on the agent choosing to be nice later (cuttable)
 - HashScan testnet as the explorer pulled up mid-demo
 - **Denominated in HBAR.** An HTS "test USDC" reads better on screen but forces
   token-association on every account — real friction for a cosmetic win
@@ -134,8 +203,8 @@ without touching call sites)
 - `claude-opus-5` for the Telegram receipt prose. Latency is irrelevant there and
   the writing is the shareable part
 
-**Agent auth** — World AgentKit. Package name and API need verifying against
-current docs; it was v0.1.5 limited beta as of March 2026. Spike first.
+**Agent auth** — World AgentKit. It was v0.1.5 limited beta as of March 2026, so
+verify the package and API against the docs MCP before building on it.
 
 **Telegram** — grammY (better TypeScript DX than Telegraf)
 
@@ -154,13 +223,13 @@ it half-wired.
 
 | Hours | Work |
 |---|---|
-| 0–4 | **Spike the two risky SDKs and nothing else.** Can you fire a Hedera testnet transfer once per second reliably from Node? Can World AgentKit issue a proof? Both are load-bearing and both are new to us. Find out before building on top of them. |
+| 0–4 | **Spike the two risky SDKs and nothing else.** Can you fire a Hedera testnet transfer once per second reliably from Node? Can World AgentKit issue a proof? Set up the World ID app and action via the Developer Portal MCP while you're here. Both SDKs are load-bearing and both are new to us — find out before building on top of them. |
 | 4–9 | **The spine.** Extension → WS → backend → transfers start → tab closes → transfers stop. Ugly is fine. This alone is demoable. |
 | 9–13 | **Classification.** Intent capture, per-page verdict, debounce and cache. This is the differentiator — protect this time. |
-| 13–19 | **World AgentKit gate** around the authority to spend, plus Telegram onboarding. |
+| 13–19 | **World AgentKit gate** around the authority to spend, plus Telegram onboarding on the Agent Kit tools, plus policies. |
 | 19–22 | **Squad mode.** Multi-recipient transfers, leaderboard state. |
 | 22–28 | **Dashboard + sound.** The meter *is* the demo. Give it real design time. |
-| 28–32 | **HCS logging**, then 0G or ENS only if genuinely free. |
+| 28–32 | **HCS hook** wired, then 0G or ENS only if genuinely free. |
 | 32–36 | **Submission.** README pointing to the code each sponsor cares about, per-sponsor docs, demo video. Several tracks grade clarity at 10% and every one requires a video — budget this properly. |
 
 ### Cut lines
@@ -179,6 +248,28 @@ it half-wired.
 If 1/sec transfers prove flaky, settle every 3 seconds and animate the counter
 smoothly between settlements. Judge sees a smooth drain; ledger shows real
 transactions. **Decide this in the hour 0–4 spike, not at hour 30.**
+
+---
+
+## Open decision: allowance vs vault account
+
+This is the sentence judges will push on, so decide it deliberately.
+
+**Allowance (faster).** User keeps their own account and key, and grants the
+agent a capped HBAR allowance. No account creation, no funding transfer, no key
+handover — a judge's own account works directly. Saves roughly 4 hours.
+*Weakness:* `DELETE_HBAR_ALLOWANCE_TOOL` exists, so the user can revoke
+mid-scroll. The escape hatch we claim to kill is technically still there.
+
+**Vault account (honest).** A separate Hedera account funded at setup whose key
+the user does not hold, with a pre-committed `ScheduleCreateTransaction`
+returning the remainder. No revoke path exists. Costs an extra custody flow.
+
+**Recommendation:** build allowance, and make revocation *loud* — log it to the
+HCS topic and surface it on the squad leaderboard. Then the honest pitch is
+"revoking is a signed, public, socially visible act" rather than "it's
+impossible", which is still far stronger than a database flag. If there's slack
+on Saturday, upgrade to the vault account.
 
 ---
 
@@ -211,12 +302,14 @@ moment. Everything else supports it.
 | Hedera testnet account ID + private key | portal.hedera.com | Free, instant. Blocks the hour-zero spike without it. |
 | Anthropic API key | console.anthropic.com | For the classifier and receipts. |
 | Telegram bot token | @BotFather | Two minutes. |
+| World developer portal team API key | developer.world.org | Unlocks the Developer Portal MCP — World ID app and action setup from the terminal. |
 | World AgentKit access | Sponsor rep at venue | Limited beta — chase early, it's the $8k track and the biggest schedule risk. |
 
 ---
 
 ## Open decisions
 
+- **Allowance vs vault account** — see above. Highest-value decision in this doc.
 - **Team roster.** Outreach sent to rxShri99 (contracts/full-stack), leah
   (frontend/design), serg_plusplus (infra), laura (AI/agents). None confirmed as
   of writing. First hire priority is frontend — the meter is the demo.
@@ -236,5 +329,7 @@ moment. Everything else supports it.
   zero and the other is explicitly cuttable.
 - **Classification + squad mode together are roughly a full extra person of
   work**, and the team is currently unconfirmed. See the cut lines.
-- **Estimated work (~41h) exceeds the window (~36h).** That's intentional — the
-  cut lines are how it fits, not a plan we hope survives contact.
+- **The schedule fits, but only just.** The original estimate was ~41h against a
+  ~36h window; the HCS hook and the allowance path together claw back about five.
+  There is no slack — the cut lines are how this ships, not a plan we hope
+  survives contact.
